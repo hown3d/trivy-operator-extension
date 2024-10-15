@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
 	k8sapierror "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,9 +37,9 @@ import (
 )
 
 type ManagedResourceController struct {
-	Client           client.Client
-	TargetRESTMapper meta.RESTMapper
-	WC               *vcontroller.WorkloadController
+	Client            client.Client
+	SubmitScanJobChan chan vcontroller.ScanJobRequest
+	ResultScanJobChan chan vcontroller.ScanJobResult
 }
 
 func (r *ManagedResourceController) SetupWithManager(mgr ctrl.Manager) error {
@@ -56,8 +55,6 @@ func (r *ManagedResourceController) SetupWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return err
 	}
-	// process scan jobs
-	go r.WC.ProcessScanJob()
 	return nil
 }
 
@@ -98,7 +95,8 @@ func (r *ManagedResourceController) reconcileManagedResource() reconcile.Func {
 				continue
 			}
 			for _, workloadObj := range objs {
-				r.WC.SubmitScanJobChan <- vcontroller.ScanJobRequest{Workload: workloadObj, Context: ctx, ClusterSbomReport: reusedReports}
+				log.V(1).Info("submitting workload", "workload", workloadObj)
+				r.SubmitScanJobChan <- vcontroller.ScanJobRequest{Workload: workloadObj, Context: ctx, ClusterSbomReport: reusedReports}
 			}
 		}
 
@@ -107,9 +105,9 @@ func (r *ManagedResourceController) reconcileManagedResource() reconcile.Func {
 		}
 
 		// collect scan job processing results
-		// scanJobResult := <-r.WC.ResultScanJobChan
-		// return scanJobResult.Result, scanJobResult.Error
-		return reconcile.Result{}, nil
+		scanJobResult := <-r.ResultScanJobChan
+		return scanJobResult.Result, scanJobResult.Error
+		// return reconcile.Result{}, nil
 	}
 }
 

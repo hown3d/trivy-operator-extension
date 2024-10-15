@@ -17,6 +17,7 @@ import (
 	vcontroller "github.com/aquasecurity/trivy-operator/pkg/vulnerabilityreport/controller"
 	"github.com/bluele/gcache"
 	"github.com/stackitcloud/trivy-operator-extension/controller"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -31,7 +32,7 @@ import (
 	gardener_resources_v1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
 )
 
-const operatorNamespace = "kube-system"
+const operatorNamespace = "trivy-system"
 
 var (
 	namespace = flag.String("namespace", "", "namespace to limit the controller to, if empty all namespaces are watched")
@@ -39,11 +40,13 @@ var (
 )
 
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 	operatorConfig, err := etc.GetOperatorConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
+	operatorConfig.Namespace = operatorNamespace
 
 	if err := run(operatorConfig); err != nil {
 		log.Fatal(err)
@@ -54,6 +57,12 @@ func run(operatorConfig etc.Config) error {
 	// Set the default manager options.
 	options := manager.Options{
 		Scheme: trivyoperator.NewScheme(),
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				operatorNamespace: {},
+				*namespace:        {},
+			},
+		},
 		Client: client.Options{
 			Cache: &client.CacheOptions{
 				DisableFor: []client.Object{
@@ -68,12 +77,6 @@ func run(operatorConfig etc.Config) error {
 	}
 
 	ctrl.SetLogger(logger)
-
-	if *namespace != "" {
-		options.Cache.DefaultNamespaces = map[string]cache.Config{
-			*namespace: {},
-		}
-	}
 
 	kubeConfig, err := ctrl.GetConfig()
 	if err != nil {
@@ -92,7 +95,7 @@ func run(operatorConfig etc.Config) error {
 	utilruntime.Must(gardener_resources_v1alpha1.AddToScheme(mgr.GetScheme()))
 	utilruntime.Must(aquav1alpha1.AddToScheme(mgr.GetScheme()))
 
-	configManager := trivyoperator.NewConfigManager(clientSet, "default")
+	configManager := trivyoperator.NewConfigManager(clientSet, operatorNamespace)
 	err = configManager.EnsureDefault(context.Background())
 	if err != nil {
 		return err
@@ -127,8 +130,15 @@ func run(operatorConfig etc.Config) error {
 		return err
 	}
 
+	submitChan := make(chan vcontroller.ScanJobRequest, operatorConfig.ConcurrentScanJobsLimit)
+	resultChan := make(chan vcontroller.ScanJobResult, operatorConfig.ConcurrentScanJobsLimit)
+	//
+	// TODO: remap the sbomreadwriters to ensure components inside the shoot are written to shoot namespace
+	sbomReadWriter := sbomreport.NewReadWriter(&objectResolver)
+	vulnReadWriter := vulnerabilityreport.NewReadWriter(&objectResolver)
+
 	wc := &vcontroller.WorkloadController{
-		Logger:           ctrl.Log.WithName("reconciler").WithName("vulnerabilityreport"),
+		Logger:           logger.WithName("reconciler").WithName("vulnerabilityreport"),
 		Config:           operatorConfig,
 		ConfigData:       trivyOperatorConfig,
 		Client:           mgr.GetClient(),
@@ -142,24 +152,52 @@ func run(operatorConfig etc.Config) error {
 			operatorConfig.TrivyServerHealthCheckCacheExpiration,
 			gcache.New(1).LRU().Build(),
 			vcontroller.NewHttpChecker()),
-		VulnerabilityReadWriter: vulnerabilityreport.NewReadWriter(&objectResolver),
-		SbomReadWriter:          sbomreport.NewReadWriter(&objectResolver),
-		SubmitScanJobChan:       make(chan vcontroller.ScanJobRequest, operatorConfig.ConcurrentScanJobsLimit),
-		ResultScanJobChan:       make(chan vcontroller.ScanJobResult, operatorConfig.ConcurrentScanJobsLimit),
+		VulnerabilityReadWriter: vulnReadWriter,
+		SbomReadWriter:          sbomReadWriter,
+		ResultScanJobChan:       resultChan,
+		SubmitScanJobChan:       submitChan,
 	}
-
-	mrc := controller.ManagedResourceController{
-		Client: mgr.GetClient(),
-		WC:     wc,
-	}
-
-	if err := mrc.SetupWithManager(mgr); err != nil {
+	if err := wc.SetupWithManager(mgr); err != nil {
 		return err
 	}
 
-	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
-		return fmt.Errorf("starting controllers manager: %w", err)
+	if err = (&vcontroller.ScanJobController{
+		Logger:                  ctrl.Log.WithName("reconciler").WithName("scan job"),
+		Config:                  operatorConfig,
+		ConfigData:              trivyOperatorConfig,
+		ObjectResolver:          objectResolver,
+		LogsReader:              kube.NewLogsReader(clientSet),
+		Plugin:                  plugin,
+		PluginContext:           pluginContext,
+		SbomReadWriter:          sbomReadWriter,
+		VulnerabilityReadWriter: vulnReadWriter,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to setup scan job  reconciler: %w", err)
 	}
 
-	return nil
+	// remove operatornamespace from managedResource cache to only reconcile MRs in namespace
+	delete(options.Cache.DefaultNamespaces, operatorNamespace)
+	managedResourceMgr, err := ctrl.NewManager(kubeConfig, options)
+	if err != nil {
+		return err
+	}
+	mrc := controller.ManagedResourceController{
+		Client:            managedResourceMgr.GetClient(),
+		SubmitScanJobChan: submitChan,
+		ResultScanJobChan: resultChan,
+	}
+	if err := mrc.SetupWithManager(managedResourceMgr); err != nil {
+		return err
+	}
+
+	g, ctx := errgroup.WithContext(signals.SetupSignalHandler())
+
+	g.Go(func() error {
+		return managedResourceMgr.Start(ctx)
+	})
+	g.Go(func() error {
+		return mgr.Start(ctx)
+	})
+
+	return g.Wait()
 }
